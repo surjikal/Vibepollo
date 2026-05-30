@@ -239,11 +239,20 @@ namespace platf::dxgi {
     uint64_t frame_qpc = 0;
     winrt::com_ptr<ID3D11Texture2D> gpu_tex;
     capture_status = _ipc_session->lock_frame(gpu_tex, frame_qpc);
+
     if (capture_status != capture_e::ok) {
       return capture_status;
     }
-    gpu_tex.copy_to(&src);
+
     _frame_locked = true;
+    auto release_wgc_frame = util::fail_guard([&]() {
+      if (_ipc_session && _frame_locked) {
+        _ipc_session->release();
+        _frame_locked = false;
+      }
+    });
+
+    gpu_tex.copy_to(&src);
 
     const auto host_processing_timestamp = std::chrono::steady_clock::now();
     auto frame_timestamp = host_processing_timestamp - qpc_time_difference(qpc_counter(), frame_qpc);
@@ -260,6 +269,7 @@ namespace platf::dxgi {
     // helper is free to publish the next frame as soon as we drop this mutex.
     _ipc_session->release();
     _frame_locked = false;
+    release_wgc_frame.disable();
 
     const auto copy_count = g_wgc_snapshot_copies.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto capture_mutex_wait_ms = std::chrono::duration<double, std::milli>(capture_mutex_wait).count();
@@ -296,14 +306,35 @@ namespace platf::dxgi {
       return capture_e::error;
     }
 
+    if (_frame_locked) {
+      BOOST_LOG(error)
+        << "WGC IPC frame was still locked at the start of acquire_next_frame(); "
+        << "releasing stale lock and requesting capture reinit.";
+
+      _ipc_session->release();
+      _frame_locked = false;
+      return capture_e::reinit;
+    }
+
     winrt::com_ptr<ID3D11Texture2D> gpu_tex;
+
     auto status = _ipc_session->acquire(effective_wgc_timeout(timeout), gpu_tex, frame_qpc);
 
     if (status != capture_e::ok) {
       return status;
     }
 
+    _frame_locked = true;
+    auto release_wgc_frame = util::fail_guard([&]() {
+      if (_ipc_session && _frame_locked) {
+        _ipc_session->release();
+        _frame_locked = false;
+      }
+    });
+
     gpu_tex.copy_to(&src);
+
+    release_wgc_frame.disable();
 
     return capture_e::ok;
   }
