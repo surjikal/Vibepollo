@@ -245,7 +245,7 @@ namespace platf::dxgi {
     }
 
     _frame_locked = true;
-    auto release_wgc_frame = util::fail_guard([&]() {
+    auto release_ipc_frame = util::fail_guard([&]() {
       if (_ipc_session && _frame_locked) {
         _ipc_session->release();
         _frame_locked = false;
@@ -269,7 +269,7 @@ namespace platf::dxgi {
     // helper is free to publish the next frame as soon as we drop this mutex.
     _ipc_session->release();
     _frame_locked = false;
-    release_wgc_frame.disable();
+    release_ipc_frame.disable();
 
     const auto copy_count = g_wgc_snapshot_copies.fetch_add(1, std::memory_order_relaxed) + 1;
     const auto capture_mutex_wait_ms = std::chrono::duration<double, std::milli>(capture_mutex_wait).count();
@@ -306,14 +306,18 @@ namespace platf::dxgi {
       return capture_e::error;
     }
 
+    // This should not normally be true. If it is, the previous caller failed
+    // to run release_snapshot(). Release the stale lock and continue instead
+    // of forcing a WGC reinit. Reinit is expensive and can cause visible video
+    // disruption; releasing our own stale keyed-mutex ownership is cheaper and
+    // preserves the running WGC helper/session.
     if (_frame_locked) {
-      BOOST_LOG(error)
+      BOOST_LOG(warning)
         << "WGC IPC frame was still locked at the start of acquire_next_frame(); "
-        << "releasing stale lock and requesting capture reinit.";
+        << "releasing stale frame lock and continuing.";
 
       _ipc_session->release();
       _frame_locked = false;
-      return capture_e::reinit;
     }
 
     winrt::com_ptr<ID3D11Texture2D> gpu_tex;
@@ -325,7 +329,7 @@ namespace platf::dxgi {
     }
 
     _frame_locked = true;
-    auto release_wgc_frame = util::fail_guard([&]() {
+    auto release_ipc_frame = util::fail_guard([&]() {
       if (_ipc_session && _frame_locked) {
         _ipc_session->release();
         _frame_locked = false;
@@ -333,8 +337,7 @@ namespace platf::dxgi {
     });
 
     gpu_tex.copy_to(&src);
-
-    release_wgc_frame.disable();
+    release_ipc_frame.disable();
 
     return capture_e::ok;
   }
