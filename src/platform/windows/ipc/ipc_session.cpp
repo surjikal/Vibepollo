@@ -34,8 +34,11 @@
 namespace platf::dxgi {
   namespace {
     constexpr auto kRecentDesktopSwitchGrace = std::chrono::seconds(3);
-    constexpr std::int64_t kWgcMinUpdateInterval100ns = 10000;  // 1 ms
+    constexpr std::int64_t kOneSecond100ns = 10'000'000;
+    constexpr std::int64_t kWgcMinUpdateIntervalFloor100ns = 10'000;
+    constexpr std::int64_t kWgcMinUpdateIntervalCeil100ns = 83'333;
     constexpr uint32_t kWgcLatencyInitialBufferSize = 2;
+    constexpr uint32_t kWgcLatencyMaxBufferSize = 3;
     std::atomic<std::int64_t> g_last_wgc_desktop_switch_us {0};
 
     std::int64_t now_steady_us() {
@@ -59,19 +62,18 @@ namespace platf::dxgi {
       return 60;
     }
 
-    std::int64_t wgc_min_update_interval_100ns(const ::video::config_t & /*config*/) {
-      // Keep WGC's producer cadence latency-first. The stream-aware half-frame
-      // interval used in 2efebf12f reduced callback pressure, but the helper then
-      // delivered visibly uneven frame cadence on real streams. Requesting the
-      // previous 1ms minimum lets WGC surface every compositor update and leaves
-      // pacing/drop decisions to Sunshine's existing capture loop.
-      return kWgcMinUpdateInterval100ns;
+    std::int64_t wgc_min_update_interval_100ns(const ::video::config_t &config) {
+      const int fps = std::max(1, wgc_target_fps(config));
+      const auto half_frame_interval = kOneSecond100ns / std::max(1, fps * 2);
+
+      return std::clamp(
+        half_frame_interval,
+        kWgcMinUpdateIntervalFloor100ns,
+        kWgcMinUpdateIntervalCeil100ns
+      );
     }
 
     uint32_t wgc_ipc_flags() {
-      // Preserve ordered WGC delivery and keep the frame pool steady-state
-      // stable. Recreating or shrinking the pool during capture can introduce
-      // cadence spikes that are worse than bounded producer backpressure.
       return 0;
     }
 
@@ -80,7 +82,7 @@ namespace platf::dxgi {
     }
 
     uint32_t wgc_max_frame_buffer_size() {
-      return kWgcLatencyInitialBufferSize;
+      return kWgcLatencyMaxBufferSize;
     }
 
     struct frame_metadata_snapshot_t {
@@ -131,12 +133,10 @@ namespace platf::dxgi {
   }
 
   ipc_session_t::~ipc_session_t() {
-    // Best-effort shutdown. Avoid throwing from a destructor.
     try {
       _initialized = false;
       _force_reinit = true;
 
-      // Flush any pending work on the capture device before tearing down shared resources.
       if (_device) {
         winrt::com_ptr<ID3D11DeviceContext> ctx;
         _device->GetImmediateContext(ctx.put());
@@ -162,7 +162,6 @@ namespace platf::dxgi {
 
       stop_helper_process();
     } catch (...) {
-      // Intentionally swallow all exceptions.
     }
   }
 
@@ -183,34 +182,28 @@ namespace platf::dxgi {
   }
 
   void ipc_session_t::initialize_if_needed() {
-    // Fast path: already successfully initialized
     if (_initialized) {
       return;
     }
 
-    // Attempt to become the initializing thread
     bool expected = false;
     if (!_initializing.compare_exchange_strong(expected, true)) {
-      // Another thread is initializing; wait until it finishes (either success or failure)
       while (_initializing) {
         std::this_thread::sleep_for(std::chrono::milliseconds(1));
       }
-      return;  // After wait, either initialized is true (success) or false (failure); caller can retry later
+      return;
     }
 
-    // We are the initializing thread now. Ensure we clear the flag on all exit paths.
     auto clear_initializing = util::fail_guard([this]() {
       _initializing = false;
     });
 
-    // Check if properly initialized via init() first
     if (!_process_helper) {
       BOOST_LOG(debug) << "Cannot initialize_if_needed without prior init()";
       _initialized = false;
       return;
     }
 
-    // Reset success flag before attempting
     _initialized = false;
 
     if (_pipe) {
@@ -230,11 +223,8 @@ namespace platf::dxgi {
     _force_reinit = false;
     _should_swap_to_dxgi = false;
 
-    // Ensure previous helper is fully stopped before restarting. This avoids overlapping D3D11 allocations
-    // across rapid re-inits that have been observed to destabilize the NVIDIA driver stack.
     stop_helper_process();
 
-    // Give the driver a brief window to release resources if we just tore down.
     if (_last_helper_stop.time_since_epoch().count() != 0) {
       auto since_stop = std::chrono::steady_clock::now() - _last_helper_stop;
       if (since_stop < std::chrono::milliseconds(200)) {
@@ -242,7 +232,6 @@ namespace platf::dxgi {
       }
     }
 
-    // Flush any pending work on the capture device before creating a new shared texture.
     if (_device) {
       winrt::com_ptr<ID3D11DeviceContext> ctx;
       _device->GetImmediateContext(ctx.put());
@@ -251,7 +240,6 @@ namespace platf::dxgi {
       }
     }
 
-    // Get the directory of the main executable (Unicode-safe)
     std::wstring exePathBuffer(MAX_PATH, L'\0');
     GetModuleFileNameW(nullptr, exePathBuffer.data(), MAX_PATH);
     exePathBuffer.resize(wcslen(exePathBuffer.data()));
@@ -299,7 +287,6 @@ namespace platf::dxgi {
       return;
     }
 
-    // Send config data to helper process
     config_data_t config_data = {};
     config_data.dynamic_range = _config.dynamicRange;
     config_data.log_level = config::sunshine.min_log_level;
@@ -309,7 +296,6 @@ namespace platf::dxgi {
     config_data.initial_frame_buffer_size = wgc_initial_frame_buffer_size();
     config_data.max_frame_buffer_size = wgc_max_frame_buffer_size();
 
-    // Convert display_name (std::string) to wchar_t[32]
     if (!_display_name.empty()) {
       std::wstring wdisplay_name(_display_name.begin(), _display_name.end());
       wcsncpy_s(config_data.display_name, wdisplay_name.c_str(), 31);
@@ -318,9 +304,6 @@ namespace platf::dxgi {
       config_data.display_name[0] = L'\0';
     }
 
-    // We need to make sure helper uses the same adapter for now.
-    // This won't be a problem in future versions when we add support for cross adapter capture.
-    // But for now, it is required that we use the exact same one.
     if (_device) {
       try_get_adapter_luid(config_data.adapter_luid);
     } else {
@@ -427,10 +410,6 @@ namespace platf::dxgi {
       return read_frame_metadata_snapshot(_frame_metadata, snapshot) && snapshot.frame_id > _last_frame_id;
     };
 
-    // The auto-reset event is a wakeup hint, not the frame predicate. With split wait/lock,
-    // Sunshine can wait for an encoder image after the event fires while the helper publishes
-    // a newer frame. In that case, lock_frame() consumes the newer metadata, and the older
-    // event can become stale. Always check metadata before and after waiting.
     if (has_new_frame()) {
       return capture_e::ok;
     }
@@ -466,7 +445,6 @@ namespace platf::dxgi {
         return capture_e::ok;
       }
 
-      // Consumed a stale auto-reset signal. With a poll-style wait, report timeout.
       if (timeout.count() <= 0) {
         return capture_e::timeout;
       }
@@ -537,7 +515,6 @@ namespace platf::dxgi {
   }
 
   capture_e ipc_session_t::lock_frame(winrt::com_ptr<ID3D11Texture2D> &gpu_tex_out, uint64_t &frame_qpc_out) {
-    // Additional validation: ensure required resources are available
     if (!_shared_texture || !_keyed_mutex) {
       _force_reinit = true;
       _initialized = false;
@@ -550,11 +527,9 @@ namespace platf::dxgi {
 
     if (hr == WAIT_ABANDONED) {
       BOOST_LOG(error) << "Helper process abandoned the keyed mutex, implying it may have crashed or was forcefully terminated.";
-      _should_swap_to_dxgi = false;  // Don't swap to DXGI, just reinit
+      _should_swap_to_dxgi = false;
       _force_reinit = true;
       _initialized = false;
-
-      // If WAIT_ABANDONED implies ownership, release immediately to avoid leaving the mutex held.
       (void) _keyed_mutex->ReleaseSync(0);
       return capture_e::reinit;
     }
@@ -573,9 +548,6 @@ namespace platf::dxgi {
       return capture_e::reinit;
     }
 
-    // The helper signals the frame-ready event only after publishing metadata
-    // and releasing this keyed mutex. After acquiring the mutex here, the
-    // metadata snapshot and shared texture contents refer to the latest frame.
     frame_metadata_snapshot_t snapshot;
     if (!read_frame_metadata_snapshot(_frame_metadata, snapshot)) {
       (void) _keyed_mutex->ReleaseSync(0);
@@ -590,9 +562,6 @@ namespace platf::dxgi {
     _last_frame_id = snapshot.frame_id;
     _frame_qpc = static_cast<uint64_t>(snapshot.frame_qpc);
 
-    // If the helper signaled again while the consumer was waiting for an encoder image
-    // before taking the keyed mutex, that signal is now stale because we just consumed
-    // the latest metadata while the helper is blocked from publishing another frame.
     while (WaitForSingleObject(_frame_ready_event.get(), 0) == WAIT_OBJECT_0) {
     }
 
@@ -610,7 +579,6 @@ namespace platf::dxgi {
                        << " slow_mutex_waits=" << _slow_mutex_waits.load(std::memory_order_relaxed);
     }
 
-    // Set output parameters
     gpu_tex_out = _shared_texture;
     frame_qpc_out = _frame_qpc;
 
@@ -639,15 +607,12 @@ namespace platf::dxgi {
       return false;
     }
 
-    // Get the helper process handle to duplicate from
     HANDLE helper_process_handle = _process_helper->get_process_handle();
     if (!helper_process_handle) {
       BOOST_LOG(error) << "Failed to get helper process handle for duplication";
       return false;
     }
 
-    // Duplicate handles from the helper process into this process. We copy from
-    // the helper because it runs at a lower integrity level.
     auto duplicate_helper_handle = [&](HANDLE source, const char *name) -> winrt::handle {
       HANDLE duplicated = nullptr;
       if (!DuplicateHandle(
@@ -693,7 +658,6 @@ namespace platf::dxgi {
       return false;
     }
 
-    // Verify texture properties
     D3D11_TEXTURE2D_DESC desc;
     texture->GetDesc(&desc);
     if (desc.Width != handle_data.width || desc.Height != handle_data.height) {
@@ -721,7 +685,6 @@ namespace platf::dxgi {
     _width = handle_data.width;
     _height = handle_data.height;
 
-    // Get keyed mutex interface for synchronization
     _keyed_mutex = _shared_texture.try_as<IDXGIKeyedMutex>();
     if (!_keyed_mutex) {
       BOOST_LOG(error) << "Failed to get keyed mutex interface from shared texture";
@@ -744,7 +707,7 @@ namespace platf::dxgi {
     }
 
     DWORD exit_code = 0;
-    _process_helper->terminate();  // best effort
+    _process_helper->terminate();
     _process_helper->wait(exit_code);
     _last_helper_stop = std::chrono::steady_clock::now();
   }
